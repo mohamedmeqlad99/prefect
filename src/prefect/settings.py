@@ -209,6 +209,44 @@ def warn_on_misconfigured_api_url(values):
     return values
 
 
+def default_database_connection_url(settings: "Settings") -> str:
+    if settings.api_database_driver == "postgresql+asyncpg":
+        required = [
+            "api_database_host",
+            "api_database_user",
+            "api_database_name",
+            "api_database_password",
+        ]
+        missing = [attr for attr in required if getattr(settings, attr) is None]
+        if missing:
+            raise ValueError(
+                f"Missing required database connection settings: {', '.join(missing)}"
+            )
+
+        from sqlalchemy import URL
+
+        return URL(
+            drivername=settings.api_database_driver,
+            host=settings.api_database_host,
+            port=settings.api_database_port or 5432,
+            username=settings.api_database_user,
+            password=settings.api_database_password,
+            database=settings.api_database_name,
+            query=[],  # type: ignore
+        ).render_as_string(hide_password=False)
+
+    elif settings.api_database_driver == "sqlite+aiosqlite":
+        if settings.api_database_name:
+            return f"{settings.api_database_driver}:///{settings.api_database_name}"
+        else:
+            return f"sqlite+aiosqlite:///{settings.home}/prefect.db"
+
+    elif settings.api_database_driver:
+        raise ValueError(f"Unsupported database driver: {settings.api_database_driver}")
+
+    return f"sqlite+aiosqlite:///{settings.home}/prefect.db"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=("~/.prefect/profiles.toml"),
@@ -748,6 +786,33 @@ class Settings(BaseSettings):
         """,
     )
 
+    server_cors_allowed_origins: str = Field(
+        default="*",
+        description="""
+        A comma-separated list of origins that are authorized to make cross-origin requests to the API.
+
+        By default, this is set to `*`, which allows requests from all origins.
+        """,
+    )
+
+    server_cors_allowed_methods: str = Field(
+        default="*",
+        description="""
+        A comma-separated list of methods that are authorized to make cross-origin requests to the API.
+
+        By default, this is set to `*`, which allows requests from all methods.
+        """,
+    )
+
+    server_cors_allowed_headers: str = Field(
+        default="*",
+        description="""
+        A comma-separated list of headers that are authorized to make cross-origin requests to the API.
+
+        By default, this is set to `*`, which allows requests from all headers.
+        """,
+    )
+
     server_allow_ephemeral_mode: bool = Field(
         default=False,
         description="""
@@ -1183,6 +1248,10 @@ class Settings(BaseSettings):
         if self.logging_settings_path is None:
             self.logging_settings_path = Path(f"{self.home}/logging.yml")
 
+        # Set default database connection URL if not provided
+        if self.api_database_connection_url is None:
+            self.api_database_connection_url = default_database_connection_url(self)
+
         return self
 
     @model_validator(mode="after")
@@ -1263,8 +1332,9 @@ class Settings(BaseSettings):
             include={str(s) for s in include} if include else None, mode="json"
         )
         return {
-            f"{self.model_config.get('env_prefix')}{key.upper()}": value
+            f"{self.model_config.get('env_prefix')}{key.upper()}": str(value)
             for key, value in env.items()
+            if value is not None
         }
 
     @model_serializer(mode="wrap")
