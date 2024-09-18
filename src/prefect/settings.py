@@ -12,9 +12,11 @@ from typing import (
     Dict,
     Generator,
     Iterable,
+    List,
     Mapping,
     Optional,
     Set,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -30,6 +32,7 @@ from pydantic import (
     Secret,
     SecretStr,
     SerializationInfo,
+    TypeAdapter,
     field_validator,
     model_serializer,
     model_validator,
@@ -37,6 +40,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing_extensions import Literal, Self
 
+from prefect.exceptions import ProfileSettingsValidationError
 from prefect.utilities.collections import visit_collection
 from prefect.utilities.names import OBFUSCATED_PREFIX
 from prefect.utilities.pydantic import handle_secret_render
@@ -95,7 +99,7 @@ class Setting:
         return hash((type(self), self.name))
 
 
-def default_ui_url(settings) -> Optional[str]:
+def default_ui_url(settings: "Settings") -> Optional[str]:
     value = settings.ui_url
     if value is not None:
         return value
@@ -1237,7 +1241,7 @@ class Settings(BaseSettings):
                     f"http://{self.server_api_host}:{self.server_api_port}"
                 )
 
-        if self.profiles_path is None:
+        if self.profiles_path is None or "PREFECT_HOME" in str(self.profiles_path):
             self.profiles_path = Path(f"{self.home}/profiles.toml")
         if self.local_storage_path is None:
             self.local_storage_path = Path(f"{self.home}/storage")
@@ -1266,6 +1270,19 @@ class Settings(BaseSettings):
         if not self.silence_api_url_misconfiguration:
             values = warn_on_misconfigured_api_url(values)
         return self
+
+    ##########################################################################
+    # Settings computed properties
+
+    @classmethod
+    def valid_setting_names(cls) -> Set[str]:
+        """
+        A set of valid setting names.
+        """
+        return set(
+            f"{cls.model_config.get("env_prefix")}{key.upper()}"
+            for key in cls.model_fields.keys()
+        )
 
     ##########################################################################
     # Settings methods
@@ -1484,10 +1501,26 @@ class Profile(BaseModel):
 
     def to_environment_variables(self) -> Dict[str, str]:
         """Convert the profile settings to a dictionary of environment variables."""
-        return {setting.name: str(value) for setting, value in self.settings.items()}
+        return {
+            setting.name: str(value)
+            for setting, value in self.settings.items()
+            if value is not None
+        }
+
+    def validate_settings(self):
+        errors: List[Tuple[Setting, Exception]] = []
+        for setting, value in self.settings.items():
+            try:
+                TypeAdapter(
+                    Settings.model_fields[setting.field_name].annotation
+                ).validate_python(value)
+            except Exception as e:
+                errors.append((setting, e))
+        if errors:
+            raise ProfileSettingsValidationError(errors)
 
     @field_validator("settings", mode="before")
-    def validate_settings(cls, v):
+    def cast_settings(cls, v):
         if not isinstance(v, dict):
             raise ValueError("Settings must be a dictionary.")
         return _cast_settings(v)
@@ -1787,7 +1820,11 @@ def update_current_profile(
     # Ensure the current profile's settings are present
     profiles.update_profile(current_profile.name, current_profile.settings)
     # Then merge the new settings in
-    profiles.update_profile(current_profile.name, _cast_settings(settings))
+    new_profile = profiles.update_profile(
+        current_profile.name, _cast_settings(settings)
+    )
+
+    new_profile.validate_settings()
 
     save_profiles(profiles)
 
@@ -1798,16 +1835,15 @@ def update_current_profile(
 # Allow traditional env var access
 
 SETTING_VARIABLES = {
-    name: Setting(name=name, default=field.default)
+    name: Setting(
+        name=f"{Settings.model_config.get('env_prefix')}{name.upper()}",
+        default=field.default,
+    )
     for name, field in Settings.model_fields.items()
 }
 
 
 def __getattr__(name: str) -> Setting:
-    if name.startswith("PREFECT_"):
-        field_name = env_var_to_attr_name(name)
-        return Setting(
-            name=name,
-            default=Settings.model_fields[field_name].default,
-        )
+    if name in Settings.valid_setting_names():
+        return SETTING_VARIABLES[env_var_to_attr_name(name)]
     raise AttributeError(f"{name} is not a Prefect setting.")
