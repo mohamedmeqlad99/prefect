@@ -19,6 +19,7 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
+    get_args,
 )
 from urllib.parse import urlparse
 
@@ -59,9 +60,10 @@ def env_var_to_attr_name(env_var: str) -> str:
 class Setting:
     """Mimics the old Setting object for compatibility with existing code."""
 
-    def __init__(self, name: str, default: Any):
+    def __init__(self, name: str, default: Any, type_: Any):
         self._name = name
         self._default = default
+        self._type = type_
 
     @property
     def name(self):
@@ -70,6 +72,15 @@ class Setting:
     @property
     def field_name(self):
         return env_var_to_attr_name(self.name)
+
+    @property
+    def is_secret(self):
+        if self._type in (Secret, SecretStr):
+            return True
+        for secret_type in (Secret, SecretStr):
+            if secret_type in get_args(self._type):
+                return True
+        return False
 
     def default(self):
         return self._default
@@ -1272,7 +1283,7 @@ class Settings(BaseSettings):
         return self
 
     ##########################################################################
-    # Settings computed properties
+    # Settings methods
 
     @classmethod
     def valid_setting_names(cls) -> Set[str]:
@@ -1280,12 +1291,9 @@ class Settings(BaseSettings):
         A set of valid setting names.
         """
         return set(
-            f"{cls.model_config.get("env_prefix")}{key.upper()}"
+            f"{cls.model_config.get('env_prefix')}{key.upper()}"
             for key in cls.model_fields.keys()
         )
-
-    ##########################################################################
-    # Settings methods
 
     def copy_with_update(
         self: Self,
@@ -1381,7 +1389,17 @@ class Settings(BaseSettings):
 
 def _cast_settings(settings: Dict[Union[str, Setting], Any]) -> Dict[Setting, Any]:
     return {
-        (Setting(name=k, default=None) if isinstance(k, str) else k): value
+        (
+            Setting(
+                name=k,
+                default=Settings.model_fields[
+                    (name := env_var_to_attr_name(k))
+                ].default,
+                type_=Settings.model_fields[name].annotation,
+            )
+            if isinstance(k, str)
+            else k
+        ): value
         for k, value in settings.items()
     }
 
@@ -1838,6 +1856,7 @@ SETTING_VARIABLES = {
     name: Setting(
         name=f"{Settings.model_config.get('env_prefix')}{name.upper()}",
         default=field.default,
+        type_=field.annotation,
     )
     for name, field in Settings.model_fields.items()
 }

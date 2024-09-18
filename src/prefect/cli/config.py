@@ -191,7 +191,6 @@ def view(
 
     # Get settings at each level, converted to a flat dictionary for easy comparison
     default_settings = prefect.settings.get_default_settings()
-    env_settings = prefect.settings.get_settings_from_env()
     current_profile = context.profile
     current_profile_settings = current_profile.settings
 
@@ -200,19 +199,13 @@ def view(
 
     settings_output = []
 
-    # Used to see which settings in current_profile_settings came from env vars
-    env_overrides = env_settings.model_dump(
-        exclude_unset=True,
-        context=dump_context,
-        include={setting.field_name for setting in current_profile_settings.keys()},
-    )
-
     for setting, value in current_profile_settings.items():
-        if env_value := env_overrides.get(setting.field_name):
+        if env_value := os.getenv(setting.name):
             source = "env"
             value = env_value
         else:
             source = "profile"
+        value = "********" if setting.is_secret and not show_secrets else value
         source_blurb = f" (from {source})" if show_sources else ""
         settings_output.append(f"{setting.name}='{value}'{source_blurb}")
 
