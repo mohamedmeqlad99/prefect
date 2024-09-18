@@ -200,8 +200,6 @@ def view(
         include={setting.field_name for setting in current_profile_settings.keys()},
     )
 
-    breakpoint()
-
     for setting, value in current_profile_settings.items():
         source = (
             "env" if env_overrides.get(setting.field_name) is not None else "profile"

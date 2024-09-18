@@ -76,6 +76,9 @@ class Setting:
             return current_value.get_secret_value()
         return current_value
 
+    def value_from(self: Self, settings: "Settings") -> Any:
+        return getattr(settings, self.field_name)
+
     def __bool__(self) -> bool:
         return bool(self.value())
 
@@ -1267,10 +1270,6 @@ class Settings(BaseSettings):
     ##########################################################################
     # Settings methods
 
-    def value_from_name(self, name: str) -> Any:
-        """Get the value of a setting from its name, like `PREFECT_API_URL`."""
-        return getattr(self, name.lower().replace("prefect_", ""))
-
     def copy_with_update(
         self: Self,
         updates: Optional[Mapping[Setting, Any]] = None,
@@ -1687,19 +1686,20 @@ def load_profiles(include_defaults: bool = True) -> ProfilesCollection:
     Load profiles from the current profile path. Optionally include profiles from the
     default profile path.
     """
+    current_settings = get_current_settings()
     default_profiles = _read_profiles_from(DEFAULT_PROFILES_PATH)
 
-    if SETTINGS.profiles_path is None:
+    if current_settings.profiles_path is None:
         raise RuntimeError(
             "No profiles path set; please ensure `PREFECT_PROFILES_PATH` is set."
         )
 
     if not include_defaults:
-        if not SETTINGS.profiles_path.exists():
+        if not current_settings.profiles_path.exists():
             return ProfilesCollection([])
-        return _read_profiles_from(SETTINGS.profiles_path)
+        return _read_profiles_from(current_settings.profiles_path)
 
-    user_profiles_path = SETTINGS.profiles_path
+    user_profiles_path = current_settings.profiles_path
     profiles = default_profiles
     if user_profiles_path.exists():
         user_profiles = _read_profiles_from(user_profiles_path)
@@ -1742,7 +1742,7 @@ def save_profiles(profiles: ProfilesCollection) -> None:
     """
     Writes all non-default profiles to the current profiles path.
     """
-    profiles_path = SETTINGS.profiles_path
+    profiles_path = get_current_settings().profiles_path
     assert profiles_path is not None, "Profiles path is not set."
     profiles = profiles.without_profile_source(DEFAULT_PROFILES_PATH)
     return _write_profiles_to(profiles_path, profiles)
@@ -1795,9 +1795,8 @@ def update_current_profile(
 
 
 ############################################################################
-# Initialize the settings object
+# Allow traditional env var access
 
-SETTINGS = Settings()
 SETTING_VARIABLES = {
     name: Setting(name=name, default=field.default)
     for name, field in Settings.model_fields.items()

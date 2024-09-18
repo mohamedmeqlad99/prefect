@@ -13,7 +13,7 @@ import yaml
 from prefect.settings import (
     PREFECT_LOGGING_EXTRA_LOGGERS,
     PREFECT_LOGGING_SETTINGS_PATH,
-    SETTINGS,
+    get_current_settings,
 )
 from prefect.utilities.collections import dict_to_flatdict, flatdict_to_dict
 
@@ -31,14 +31,16 @@ def load_logging_config(path: Path) -> dict:
     """
     Loads logging configuration from a path allowing override from the environment
     """
+    current_settings = get_current_settings()
     template = string.Template(path.read_text())
 
     # Build a mapping from environment variable names to values
     mapping = {}
-    for field_name, value in SETTINGS.model_dump().items():
+    for field_name, value in current_settings.model_dump().items():
         if value is not None:
             env_var_name = (
-                SETTINGS.model_config.get("env_prefix", "PREFECT_") + field_name.upper()
+                current_settings.model_config.get("env_prefix", "PREFECT_")
+                + field_name.upper()
             )
             mapping[env_var_name] = str(value)
 
