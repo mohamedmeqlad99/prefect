@@ -34,6 +34,7 @@ from pydantic import (
     SecretStr,
     SerializationInfo,
     TypeAdapter,
+    ValidationError,
     field_validator,
     model_serializer,
     model_validator,
@@ -48,6 +49,7 @@ from prefect.utilities.pydantic import handle_secret_render
 
 T = TypeVar("T")
 DEFAULT_PROFILES_PATH = Path(__file__).parent.joinpath("profiles.toml")
+SECRET_TYPES: Tuple[type, ...] = (Secret, SecretStr)
 
 
 def env_var_to_attr_name(env_var: str) -> str:
@@ -75,9 +77,9 @@ class Setting:
 
     @property
     def is_secret(self):
-        if self._type in (Secret, SecretStr):
+        if self._type in SECRET_TYPES:
             return True
-        for secret_type in (Secret, SecretStr):
+        for secret_type in SECRET_TYPES:
             if secret_type in get_args(self._type):
                 return True
         return False
@@ -108,6 +110,11 @@ class Setting:
 
     def __hash__(self) -> int:
         return hash((type(self), self.name))
+
+
+########################################################################
+# Define post init validators for use in an "after" model_validator,
+# core logic should remain similar after context-aw
 
 
 def default_ui_url(settings: "Settings") -> Optional[str]:
@@ -173,12 +180,12 @@ def warn_on_database_password_value_without_usage(values):
     """
     Validator for settings warning if the database password is set but not used.
     """
-    value = values["api_database_password"]
+    value = v.get_secret_value() if (v := values["api_database_password"]) else None
     if (
         value
         and not value.startswith(OBFUSCATED_PREFIX)
         and values["api_database_connection_url"] is not None
-        and ("api_database_password" not in values["api_database_connection_url"])
+        and (value not in values["api_database_connection_url"].get_secret_value())
     ):
         warnings.warn(
             "PREFECT_API_DATABASE_PASSWORD is set but not included in the "
@@ -227,7 +234,8 @@ def warn_on_misconfigured_api_url(values):
     return values
 
 
-def default_database_connection_url(settings: "Settings") -> str:
+def default_database_connection_url(settings: "Settings") -> SecretStr:
+    value = None
     if settings.api_database_driver == "postgresql+asyncpg":
         required = [
             "api_database_host",
@@ -255,14 +263,15 @@ def default_database_connection_url(settings: "Settings") -> str:
 
     elif settings.api_database_driver == "sqlite+aiosqlite":
         if settings.api_database_name:
-            return f"{settings.api_database_driver}:///{settings.api_database_name}"
+            value = f"{settings.api_database_driver}:///{settings.api_database_name}"
         else:
-            return f"sqlite+aiosqlite:///{settings.home}/prefect.db"
+            value = f"sqlite+aiosqlite:///{settings.home}/prefect.db"
 
     elif settings.api_database_driver:
         raise ValueError(f"Unsupported database driver: {settings.api_database_driver}")
 
-    return f"sqlite+aiosqlite:///{settings.home}/prefect.db"
+    value = value if value else f"sqlite+aiosqlite:///{settings.home}/prefect.db"
+    return SecretStr(value)
 
 
 class Settings(BaseSettings):
@@ -391,7 +400,7 @@ class Settings(BaseSettings):
     ###########################################################################
     # API Database settings
 
-    api_database_connection_url: Optional[str] = Field(
+    api_database_connection_url: Optional[SecretStr] = Field(
         default=None,
         description="""
         A database connection URL in a SQLAlchemy-compatible
@@ -434,7 +443,7 @@ class Settings(BaseSettings):
         description="The name of the Prefect database on the remote server, or the path to the database file for SQLite.",
     )
 
-    api_database_password: Optional[str] = Field(
+    api_database_password: Optional[SecretStr] = Field(
         default=None,
         description="The password to use when connecting to the database. Should be kept secret.",
     )
@@ -1240,6 +1249,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def post_hoc_settings(self) -> Self:
+        # TODO: refactor on resolution of https://github.com/pydantic/pydantic/issues/9789
         if self.cloud_ui_url is None:
             self.cloud_ui_url = default_cloud_ui_url(self)
         if self.ui_url is None:
@@ -1344,16 +1354,13 @@ class Settings(BaseSettings):
 
         if exclude_unset:
             include.intersection_update(
-                {
-                    key
-                    for key in self.model_dump(
-                        exclude_unset=True, context={"include_secrets": include_secrets}
-                    )
-                }
+                {key for key in self.model_dump(exclude_unset=True)}
             )
 
         env: Dict[str, Any] = self.model_dump(
-            include={str(s) for s in include} if include else None, mode="json"
+            include={str(s) for s in include} if include else None,
+            mode="json",
+            context={"include_secrets": include_secrets},
         )
         return {
             f"{self.model_config.get('env_prefix')}{key.upper()}": str(value)
@@ -1365,9 +1372,6 @@ class Settings(BaseSettings):
     def ser_model(self, handler: Callable, info: SerializationInfo) -> Any:
         jsonable_self = handler(self)
         if (ctx := info.context) and ctx.get("include_secrets") is True:
-            fields_to_consider = set(self.model_fields.keys()).intersection(
-                (info.include or set())
-            )
             jsonable_self.update(
                 {
                     field_name: visit_collection(
@@ -1375,7 +1379,7 @@ class Settings(BaseSettings):
                         visit_fn=partial(handle_secret_render, context=ctx),
                         return_data=True,
                     )
-                    for field_name in fields_to_consider
+                    for field_name in set(self.model_fields.keys())
                 }
             )
         return jsonable_self
@@ -1526,13 +1530,13 @@ class Profile(BaseModel):
         }
 
     def validate_settings(self):
-        errors: List[Tuple[Setting, Exception]] = []
+        errors: List[Tuple[Setting, ValidationError]] = []
         for setting, value in self.settings.items():
             try:
                 TypeAdapter(
                     Settings.model_fields[setting.field_name].annotation
                 ).validate_python(value)
-            except Exception as e:
+            except ValidationError as e:
                 errors.append((setting, e))
         if errors:
             raise ProfileSettingsValidationError(errors)
